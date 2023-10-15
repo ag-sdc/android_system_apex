@@ -359,6 +359,7 @@ Result<void> ConfigureLoopDevice(const int device_fd, const std::string& target,
     if (statfs(target.c_str(), &stbuf) != 0 ||
         (stbuf.f_type != EROFS_SUPER_MAGIC_V1 &&
          stbuf.f_type != SQUASHFS_MAGIC &&
+         stbuf.f_type != TMPFS_MAGIC &&
          stbuf.f_type != OVERLAYFS_SUPER_MAGIC)) {
       return Error(saved_errno) << "Failed to open " << target;
     }
