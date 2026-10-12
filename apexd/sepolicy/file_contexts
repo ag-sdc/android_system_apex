@@ -1,0 +1,4 @@
+# File contexts for APEX public key directories
+/data/apex/keys(/.*)?           u:object_r:apex_key_data_file:s0
+/product/apex/keys(/.*)?        u:object_r:system_file:s0
+/system/bin/apex_key_manager    u:object_r:apex_key_manager_exec:s0

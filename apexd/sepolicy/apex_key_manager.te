@@ -1,0 +1,19 @@
+# Domain definition for apex_key_manager CLI utility
+type apex_key_manager, domain, coredomain;
+type apex_key_manager_exec, exec_type, file_type, system_file_type;
+
+init_daemon_domain(apex_key_manager)
+
+# Allow shell to execute apex_key_manager
+domain_auto_trans(shell, apex_key_manager_exec, apex_key_manager)
+
+# Binder communication with apexd
+binder_use(apex_key_manager)
+binder_call(apex_key_manager, apexd)
+
+# Allow finding apex_service in servicemanager
+allow apex_key_manager apex_service:service_manager find;
+
+# Allow reading terminal / pipe fds
+allow apex_key_manager devpts:chr_file rw_file_perms;
+allow apex_key_manager shell:fd use;

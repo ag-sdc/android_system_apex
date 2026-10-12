@@ -1,0 +1,2 @@
+# Type definition for runtime-installed APEX public keys in /data/apex/keys
+type apex_key_data_file, file_type, data_file_type, core_data_file_type;

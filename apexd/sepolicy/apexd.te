@@ -1,0 +1,19 @@
+# Allow apexd to manage key storage directory and key files in /data/apex/keys
+allow apexd apex_key_data_file:dir create_dir_perms;
+allow apexd apex_key_data_file:file create_file_perms;
+
+# Allow apexd to read pre-installed public keys from /product/apex/keys (system_file)
+allow apexd system_file:dir r_dir_perms;
+allow apexd system_file:file r_file_perms;
+
+# Neverallow: only apexd and init can create/write files in /data/apex/keys
+neverallow { domain -apexd -init } apex_key_data_file:dir no_w_dir_perms;
+neverallow { domain -apexd -init } apex_key_data_file:file no_w_file_perms;
+
+# Neverallow: untrusted apps must have no access to /data/apex/keys
+neverallow { appdomain } apex_key_data_file:dir no_rw_file_perms;
+neverallow { appdomain } apex_key_data_file:file no_rw_file_perms;
+
+# Allow shell to read /data/apex/keys for debugging and inspection, but no write
+allow shell apex_key_data_file:dir r_dir_perms;
+allow shell apex_key_data_file:file r_file_perms;
