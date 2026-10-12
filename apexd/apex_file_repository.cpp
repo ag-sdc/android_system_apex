@@ -27,6 +27,7 @@
 
 #include "apex_constants.h"
 #include "apex_file.h"
+#include "apex_key_manager.h"
 #include "apexd_utils.h"
 #include "apexd_verity.h"
 
@@ -335,26 +336,40 @@ Result<void> ApexFileRepository::AddDataApex(const std::string& data_dir) {
     }
 
     const std::string& name = apex_file->GetManifest().name();
-    if (!HasPreInstalledVersion(name)) {
-      LOG(ERROR) << "Skipping " << file << " : no preinstalled apex";
-      // Ignore data apex without corresponding pre-installed apex
+    const bool is_preinstalled = HasPreInstalledVersion(name);
+    const bool is_trusted_by_manager =
+        ApexKeyManager::GetInstance().IsKeyTrusted(
+            name, apex_file->GetBundledPublicKey());
+
+    if (!is_preinstalled && !is_trusted_by_manager) {
+      LOG(WARNING)
+          << "Skipping " << file
+          << " : no preinstalled apex and key not trusted by ApexKeyManager";
       continue;
     }
 
-    std::string select_filename = GetApexSelectFilenameFromProp(
-        multi_install_select_prop_prefixes_, name);
-    if (!select_filename.empty()) {
-      LOG(WARNING) << "APEX " << name << " is a multi-installed APEX."
-                   << " Any updated version in /data will always overwrite"
-                   << " the multi-installed preinstalled version, if possible.";
+    if (!is_preinstalled && is_trusted_by_manager) {
+      LOG(INFO) << "Accepting non-builtin APEX " << file << " (" << name
+                << ") authorized by ApexKeyManager";
     }
 
-    auto pre_installed_public_key = GetPublicKey(name);
-    if (!pre_installed_public_key.ok() ||
-        apex_file->GetBundledPublicKey() != *pre_installed_public_key) {
-      // Ignore data apex if public key doesn't match with pre-installed apex
+    if (is_preinstalled) {
+      std::string select_filename = GetApexSelectFilenameFromProp(
+          multi_install_select_prop_prefixes_, name);
+      if (!select_filename.empty()) {
+        LOG(WARNING)
+            << "APEX " << name << " is a multi-installed APEX."
+            << " Any updated version in /data will always overwrite"
+            << " the multi-installed preinstalled version, if possible.";
+      }
+    }
+
+    auto expected_public_key =
+        GetPublicKey(name, apex_file->GetBundledPublicKey());
+    if (!expected_public_key.ok() ||
+        apex_file->GetBundledPublicKey() != *expected_public_key) {
       LOG(ERROR) << "Skipping " << file
-                 << " : public key doesn't match pre-installed one";
+                 << " : public key doesn't match trusted one";
       continue;
     }
 
@@ -387,19 +402,66 @@ Result<void> ApexFileRepository::AddDataApex(const std::string& data_dir) {
 //  by name
 Result<const std::string> ApexFileRepository::GetPublicKey(
     const std::string& name) const {
-  auto it = pre_installed_store_.find(name);
-  if (it == pre_installed_store_.end()) {
-    // Special casing for APEXes backed by block devices, i.e. APEXes in VM.
-    // Inside a VM, we fall back to find the key from data_store_. This is
-    // because an APEX is put to either pre_installed_store_ or data_store,
-    // depending on whether it was a factory APEX or not in the host.
-    it = data_store_.find(name);
-    if (it != data_store_.end() && IsBlockApex(it->second)) {
-      return it->second.GetBundledPublicKey();
-    }
-    return Error() << "No preinstalled apex found for package " << name;
+  return GetPublicKey(name, /*bundled_pubkey=*/"");
+}
+
+Result<const std::string> ApexFileRepository::GetPublicKey(
+    const std::string& name, const std::string& bundled_pubkey) const {
+  if (name.empty() || name.find('/') != std::string::npos ||
+      name.find('\\') != std::string::npos ||
+      name.find("..") != std::string::npos) {
+    return Error() << "Invalid package name query: '" << name << "'";
   }
-  return it->second.GetBundledPublicKey();
+
+#ifdef APEX_ALLOW_KEY_OVERRIDE
+  // 1. ApexKeyManager takes priority when APEX_ALLOW_KEY_OVERRIDE is defined
+  auto& key_manager = ApexKeyManager::GetInstance();
+  auto key_res = bundled_pubkey.empty()
+                     ? key_manager.GetKeyForPackage(name)
+                     : key_manager.GetKeyForPackage(name, bundled_pubkey);
+  if (key_res.ok()) {
+    return *key_res;
+  }
+
+  // 2. Pre-installed Store
+  auto it = pre_installed_store_.find(name);
+  if (it != pre_installed_store_.end()) {
+    return it->second.GetBundledPublicKey();
+  }
+#else
+  // 1. Pre-installed Store takes priority by default
+  auto it = pre_installed_store_.find(name);
+  if (it != pre_installed_store_.end()) {
+    return it->second.GetBundledPublicKey();
+  }
+
+  // 2. ApexKeyManager
+  auto& key_manager = ApexKeyManager::GetInstance();
+  auto key_res = bundled_pubkey.empty()
+                     ? key_manager.GetKeyForPackage(name)
+                     : key_manager.GetKeyForPackage(name, bundled_pubkey);
+  if (key_res.ok()) {
+    return *key_res;
+  }
+#endif
+
+  // 3. Data Store (Block APEX / VM mode, or trusted non-builtin APEX)
+  auto data_it = data_store_.find(name);
+  if (data_it != data_store_.end()) {
+    if (IsBlockApex(data_it->second)) {
+      return data_it->second.GetBundledPublicKey();
+    }
+    if (!HasPreInstalledVersion(name) &&
+        ApexKeyManager::GetInstance().IsKeyTrusted(
+            name, data_it->second.GetBundledPublicKey())) {
+      if (bundled_pubkey.empty() ||
+          bundled_pubkey == data_it->second.GetBundledPublicKey()) {
+        return data_it->second.GetBundledPublicKey();
+      }
+    }
+  }
+
+  return Error() << "No preinstalled apex found for package " << name;
 }
 
 // TODO(b/179497746): remove this method when we add api for fetching ApexFile

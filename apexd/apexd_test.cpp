@@ -39,6 +39,7 @@
 #include "apex_database.h"
 #include "apex_file.h"
 #include "apex_file_repository.h"
+#include "apex_key_manager.h"
 #include "apex_manifest.pb.h"
 #include "apexd_checkpoint.h"
 #include "apexd_loop.h"
@@ -5135,6 +5136,146 @@ TEST_F(ApexdMountTest, SubmitSingleStagedSessionKeepsPreviousSessions) {
 
   ASSERT_EQ(239, sessions[3].GetId());
   ASSERT_EQ(SessionState::VERIFIED, sessions[3].GetState());
+}
+
+TEST_F(ApexdMountTest, ActivateNonBuiltinWithTrustedKeySucceeds) {
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  std::string product_keys_dir = StringPrintf("%s/product_keys", td_.path);
+  std::string data_keys_dir = StringPrintf("%s/data_keys", td_.path);
+  ASSERT_EQ(0, mkdir(product_keys_dir.c_str(), 0755));
+  ASSERT_EQ(0, mkdir(data_keys_dir.c_str(), 0755));
+
+  std::string file_path = AddDataApex("apex.apexd_test_no_inst_key.apex");
+  auto apex_file = ApexFile::Open(file_path);
+  ASSERT_RESULT_OK(apex_file);
+  const std::string pubkey = apex_file->GetBundledPublicKey();
+
+  std::string key_path =
+      StringPrintf("%s/no_inst.avbpubkey", product_keys_dir.c_str());
+  ASSERT_TRUE(android::base::WriteStringToFile(pubkey, key_path));
+
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(product_keys_dir,
+                                                            data_keys_dir));
+
+  auto& repo = ApexFileRepository::GetInstance();
+  ASSERT_RESULT_OK(repo.AddDataApex(GetDataDir()));
+  ASSERT_TRUE(repo.HasDataVersion("com.android.apex.test_package.no_inst_key"));
+
+  ASSERT_THAT(ActivatePackage(file_path), Ok());
+  UnmountOnTearDown(file_path);
+
+  const std::string pkg_name = "com.android.apex.test_package.no_inst_key";
+  auto active_apex = GetActivePackage(pkg_name);
+  ASSERT_THAT(active_apex, Ok());
+  ASSERT_EQ(active_apex->GetPath(), file_path);
+  ASSERT_EQ(active_apex->GetManifest().version(), 1);
+
+  auto mounts = GetApexMounts();
+  EXPECT_THAT(mounts, testing::Contains("/apex/" + pkg_name));
+  EXPECT_THAT(mounts, testing::Contains("/apex/" + pkg_name + "@1"));
+
+  auto& db = GetApexDatabaseForTesting();
+  bool found_active = false;
+  db.ForallMountedApexes(pkg_name, [&](const MountedApexData& d, bool active) {
+    if (active) found_active = true;
+  });
+  EXPECT_TRUE(found_active);
+
+  ASSERT_THAT(DeactivatePackage(file_path), Ok());
+  EXPECT_THAT(GetActivePackage(pkg_name), Not(Ok()));
+}
+
+TEST_F(ApexdMountTest, ActivateNonBuiltinWithoutTrustedKeyFailsGracefully) {
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  std::string product_keys_dir = StringPrintf("%s/product_keys", td_.path);
+  std::string data_keys_dir = StringPrintf("%s/data_keys", td_.path);
+  ASSERT_EQ(0, mkdir(product_keys_dir.c_str(), 0755));
+  ASSERT_EQ(0, mkdir(data_keys_dir.c_str(), 0755));
+
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(product_keys_dir,
+                                                            data_keys_dir));
+
+  std::string file_path = AddDataApex("apex.apexd_test_no_inst_key.apex");
+
+  auto& repo = ApexFileRepository::GetInstance();
+  ASSERT_RESULT_OK(repo.AddDataApex(GetDataDir()));
+  EXPECT_FALSE(
+      repo.HasDataVersion("com.android.apex.test_package.no_inst_key"));
+
+  auto status = ActivatePackage(file_path);
+  ASSERT_THAT(status, Not(Ok()));
+  EXPECT_THAT(status.error().message(),
+              testing::AnyOf(testing::HasSubstr("No preinstalled apex found"),
+                             testing::HasSubstr("not trusted"),
+                             testing::HasSubstr("Failed to verify")));
+
+  const std::string pkg_name = "com.android.apex.test_package.no_inst_key";
+  EXPECT_THAT(GetActivePackage(pkg_name), Not(Ok()));
+
+  auto mounts = GetApexMounts();
+  EXPECT_THAT(mounts, Not(testing::Contains("/apex/" + pkg_name)));
+}
+
+TEST_F(ApexdMountTest, HotReloadKeyEnablesActivationWithoutRestart) {
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  std::string product_keys_dir = StringPrintf("%s/product_keys", td_.path);
+  std::string data_keys_dir = StringPrintf("%s/data_keys", td_.path);
+  ASSERT_EQ(0, mkdir(product_keys_dir.c_str(), 0755));
+  ASSERT_EQ(0, mkdir(data_keys_dir.c_str(), 0755));
+
+  // Initialize with empty key directories
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(product_keys_dir,
+                                                            data_keys_dir));
+
+  std::string file_path = AddDataApex("apex.apexd_test_no_inst_key.apex");
+  const std::string pkg_name = "com.android.apex.test_package.no_inst_key";
+
+  auto& repo = ApexFileRepository::GetInstance();
+  ASSERT_RESULT_OK(repo.AddDataApex(GetDataDir()));
+
+  // Phase 1: Activation must fail before key is provided
+  EXPECT_FALSE(repo.HasDataVersion(pkg_name));
+  auto initial_activate = ActivatePackage(file_path);
+  ASSERT_THAT(initial_activate, Not(Ok()));
+  EXPECT_THAT(GetActivePackage(pkg_name), Not(Ok()));
+
+  // Phase 2: Dynamic key installation into data keys directory
+  auto apex_file = ApexFile::Open(file_path);
+  ASSERT_RESULT_OK(apex_file);
+  const std::string pubkey = apex_file->GetBundledPublicKey();
+
+  std::string key_file =
+      StringPrintf("%s/hotreload.avbpubkey", data_keys_dir.c_str());
+  ASSERT_TRUE(android::base::WriteStringToFile(pubkey, key_file));
+
+  // Trigger hot reload
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().ReloadDataKeys());
+  EXPECT_TRUE(ApexKeyManager::GetInstance().IsKeyTrusted(pkg_name, pubkey));
+
+  // Phase 3: Rescan and activate without restarting daemon
+  ASSERT_RESULT_OK(repo.AddDataApex(GetDataDir()));
+  EXPECT_TRUE(repo.HasDataVersion(pkg_name));
+
+  ASSERT_THAT(ActivatePackage(file_path), Ok());
+  UnmountOnTearDown(file_path);
+
+  auto active_apex = GetActivePackage(pkg_name);
+  ASSERT_THAT(active_apex, Ok());
+  ASSERT_EQ(active_apex->GetPath(), file_path);
+
+  auto mounts = GetApexMounts();
+  EXPECT_THAT(mounts, testing::Contains("/apex/" + pkg_name));
+
+  ASSERT_THAT(DeactivatePackage(file_path), Ok());
 }
 
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {

@@ -103,6 +103,7 @@ aidl_interface {
     "aidl/android/apex/ApexInfoList.aidl",
     "aidl/android/apex/ApexSessionInfo.aidl",
     "aidl/android/apex/ApexSessionParams.aidl",
+    "aidl/android/apex/ApexTrustedKey.aidl",
     "aidl/android/apex/CompressedApexInfo.aidl",
     "aidl/android/apex/CompressedApexInfoList.aidl",
     "aidl/android/apex/IApexService.aidl",
@@ -174,6 +175,22 @@ cc_binary {
   stem: "apexd",
 }
 
+cc_binary {
+  name: "apex_key_manager",
+  defaults: [
+    "apex_flags_defaults",
+  ],
+  srcs: [
+    "apex_key_manager_main.cpp",
+  ],
+  shared_libs: [
+    "apex_aidl_interface-cpp",
+    "libbase",
+    "libbinder",
+    "libutils",
+  ],
+}
+
 cc_library_static {
   name: "libapexd",
   defaults: [
@@ -184,6 +201,7 @@ cc_library_static {
     "apex_classpath.cpp",
     "apex_database.cpp",
     "apex_file_repository.cpp",
+    "apex_key_manager.cpp",
     "apexd.cpp",
     "apexd_lifecycle.cpp",
     "apexd_loop.cpp",
@@ -528,6 +546,7 @@ cc_test {
     "apex_database_test.cpp",
     "apex_file_test.cpp",
     "apex_file_repository_test.cpp",
+    "apex_key_manager_test.cpp",
     "apex_manifest_test.cpp",
     "apexd_test.cpp",
     "apexd_session_test.cpp",
@@ -648,6 +667,36 @@ cc_test {
   generated_sources: ["apex-info-list-tinyxml"],
   test_suites: ["device-tests"],
   test_config: "ApexServiceTestCases.xml",
+}
+
+cc_test {
+  name: "apex_key_manager_test",
+  defaults: [
+    "apex_flags_defaults",
+  ],
+  cflags: [
+    "-Wno-used-but-marked-unused",
+  ],
+  srcs: [
+    "apex_key_manager.cpp",
+    "apex_key_manager_test.cpp",
+  ],
+  host_supported: true,
+  static_libs: [
+    "libbase",
+    "libtinyxml2",
+    "libavb",
+    "liblog",
+    "libgmock",
+    "libc++fs",
+  ],
+  data: [
+    "apexd_testdata/com.android.apex.test_package.avbpubkey",
+    "apexd_testdata/com.android.apex.test_package_2.avbpubkey",
+    "apexd_testdata/com.android.apex.test_package.no_inst_key.avbpubkey",
+    "apexd_testdata/com.android.apex.compressed.avbpubkey",
+  ],
+  test_suites: ["device-tests"],
 }
 
 xsd_config {

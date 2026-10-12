@@ -16,32 +16,31 @@
 
 #include "apexservice.h"
 
-#include <dirent.h>
-#include <stdio.h>
-#include <stdlib.h>
-
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/result.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <android/apex/BnApexService.h>
 #include <binder/IPCThreadState.h>
 #include <binder/IResultReceiver.h>
 #include <binder/IServiceManager.h>
 #include <binder/LazyServiceRegistrar.h>
 #include <binder/ProcessState.h>
 #include <binder/Status.h>
+#include <dirent.h>
 #include <private/android_filesystem_config.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <utils/String16.h>
 
 #include "apex_file.h"
 #include "apex_file_repository.h"
+#include "apex_key_manager.h"
 #include "apexd.h"
 #include "apexd_session.h"
 #include "string_log.h"
-
-#include <android/apex/BnApexService.h>
 
 using android::base::Join;
 using android::base::Result;
@@ -78,7 +77,7 @@ class ApexService : public BnApexService {
   using BinderStatus = ::android::binder::Status;
   using SessionState = ::apex::proto::SessionState;
 
-  ApexService(){};
+  ApexService() {};
 
   BinderStatus stagePackages(const std::vector<std::string>& paths) override;
   BinderStatus unstagePackages(const std::vector<std::string>& paths) override;
@@ -120,6 +119,14 @@ class ApexService : public BnApexService {
   BinderStatus installAndActivatePackage(const std::string& package_path,
                                          bool force,
                                          ApexInfo* aidl_return) override;
+  BinderStatus addTrustedKey(
+      const std::string& keyPath, const std::optional<std::string>& keyName,
+      const std::optional<std::vector<std::optional<std::string>>>&
+          allowedPackages) override;
+  BinderStatus removeTrustedKey(const std::string& keyName) override;
+  BinderStatus listTrustedKeys(
+      std::vector<ApexTrustedKey>* aidl_return) override;
+  BinderStatus reloadKeys() override;
 
   status_t dump(int fd, const Vector<String16>& args) override;
 
@@ -568,6 +575,104 @@ BinderStatus ApexService::installAndActivatePackage(
   }
   *aidl_return = GetApexInfo(*res);
   aidl_return->isActive = true;
+  return BinderStatus::ok();
+}
+
+BinderStatus ApexService::addTrustedKey(
+    const std::string& keyPath, const std::optional<std::string>& keyName,
+    const std::optional<std::vector<std::optional<std::string>>>&
+        allowedPackages) {
+  LOG(INFO) << "addTrustedKey() received by ApexService, keyPath: " << keyPath
+            << " keyName: " << keyName.value_or("(null)");
+
+  auto check = CheckCallerSystemOrRoot("addTrustedKey");
+  if (!check.isOk()) {
+    return check;
+  }
+
+  std::vector<std::string> packages;
+  if (allowedPackages.has_value()) {
+    for (const auto& pkg : *allowedPackages) {
+      if (pkg.has_value() && !pkg->empty()) {
+        packages.push_back(*pkg);
+      }
+    }
+  }
+
+  Result<void> res =
+      ApexKeyManager::GetInstance().AddKey(keyPath, keyName, packages);
+  if (!res.ok()) {
+    LOG(ERROR) << "Failed to add trusted key: " << res.error();
+    return BinderStatus::fromExceptionCode(
+        BinderStatus::EX_SERVICE_SPECIFIC,
+        String8(res.error().message().c_str()));
+  }
+
+  return BinderStatus::ok();
+}
+
+BinderStatus ApexService::removeTrustedKey(const std::string& keyName) {
+  LOG(INFO) << "removeTrustedKey() received by ApexService, keyName: "
+            << keyName;
+
+  auto check = CheckCallerSystemOrRoot("removeTrustedKey");
+  if (!check.isOk()) {
+    return check;
+  }
+
+  Result<void> res = ApexKeyManager::GetInstance().RemoveKey(keyName);
+  if (!res.ok()) {
+    LOG(ERROR) << "Failed to remove trusted key '" << keyName
+               << "': " << res.error();
+    return BinderStatus::fromExceptionCode(
+        BinderStatus::EX_SERVICE_SPECIFIC,
+        String8(res.error().message().c_str()));
+  }
+
+  return BinderStatus::ok();
+}
+
+BinderStatus ApexService::listTrustedKeys(
+    std::vector<ApexTrustedKey>* aidl_return) {
+  LOG(INFO) << "listTrustedKeys() received by ApexService";
+
+  auto check = CheckCallerSystemOrRoot("listTrustedKeys");
+  if (!check.isOk()) {
+    return check;
+  }
+
+  const auto& keys = ApexKeyManager::GetInstance().ListKeys();
+  aidl_return->clear();
+  aidl_return->reserve(keys.size());
+  for (const auto& key : keys) {
+    ApexTrustedKey out;
+    out.name = key.name;
+    out.path = key.path;
+    out.pubkey.assign(key.pubkey.begin(), key.pubkey.end());
+    out.allowedPackages = key.allowed_packages;
+    out.fromProduct = key.from_product;
+    aidl_return->push_back(std::move(out));
+  }
+
+  return BinderStatus::ok();
+}
+
+BinderStatus ApexService::reloadKeys() {
+  LOG(INFO) << "reloadKeys() received by ApexService";
+
+  auto check = CheckCallerSystemOrRoot("reloadKeys");
+  if (!check.isOk()) {
+    return check;
+  }
+
+  Result<void> res = ApexKeyManager::GetInstance().ReloadDataKeys();
+  if (!res.ok()) {
+    LOG(ERROR) << "Failed to reload keys: " << res.error();
+    return BinderStatus::fromExceptionCode(
+        BinderStatus::EX_SERVICE_SPECIFIC,
+        String8(res.error().message().c_str()));
+  }
+
   return BinderStatus::ok();
 }
 
@@ -1090,10 +1195,10 @@ status_t ApexService::shellCommand(int in, int out, int err,
     params.childSessionIds = empty_child_session_ids;
     BinderStatus status = submitStagedSession(params, &list);
     if (status.isOk()) {
-        for (const auto& item : list.apexInfos) {
-          std::string msg = ToString(item);
-          dprintf(out, "%s", msg.c_str());
-        }
+      for (const auto& item : list.apexInfos) {
+        std::string msg = ToString(item);
+        dprintf(out, "%s", msg.c_str());
+      }
       return OK;
     }
     std::string msg = StringLog() << "Failed to submit session: "

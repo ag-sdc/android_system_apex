@@ -75,6 +75,7 @@
 #include "apex_database.h"
 #include "apex_file.h"
 #include "apex_file_repository.h"
+#include "apex_key_manager.h"
 #include "apex_manifest.h"
 #include "apex_shim.h"
 #include "apexd_checkpoint.h"
@@ -505,7 +506,8 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
 
   auto& instance = ApexFileRepository::GetInstance();
 
-  auto public_key = instance.GetPublicKey(apex.GetManifest().name());
+  auto public_key = instance.GetPublicKey(apex.GetManifest().name(),
+                                          apex.GetBundledPublicKey());
   if (!public_key.ok()) {
     return public_key.error();
   }
@@ -817,7 +819,8 @@ Result<void> VerifyVndkVersion(const ApexFile& apex_file) {
 Result<void> VerifyPackageBoot(const ApexFile& apex_file) {
   // TODO(ioffe): why do we need this here?
   auto& instance = ApexFileRepository::GetInstance();
-  auto public_key = instance.GetPublicKey(apex_file.GetManifest().name());
+  auto public_key = instance.GetPublicKey(apex_file.GetManifest().name(),
+                                          apex_file.GetBundledPublicKey());
   if (!public_key.ok()) {
     return public_key.error();
   }
@@ -2442,6 +2445,14 @@ int OnBootstrap() {
   ATRACE_NAME("OnBootstrap");
   auto time_started = boot_clock::now();
 
+  ApexKeyManager& key_manager = ApexKeyManager::GetInstance();
+  auto km_status =
+      key_manager.Initialize(kProductApexKeysDir, kDataApexKeysDir);
+  if (!km_status.ok()) {
+    LOG(WARNING) << "Failed to initialize ApexKeyManager during bootstrap: "
+                 << km_status.error();
+  }
+
   ApexFileRepository& instance = ApexFileRepository::GetInstance();
   Result<void> status =
       instance.AddPreInstalledApex(gConfig->apex_built_in_dirs);
@@ -2563,6 +2574,13 @@ void InitializeSessionManager(ApexSessionManager* session_manager) {
 
 void Initialize(CheckpointInterface* checkpoint_service) {
   InitializeVold(checkpoint_service);
+  ApexKeyManager& key_manager = ApexKeyManager::GetInstance();
+  auto km_status =
+      key_manager.Initialize(kProductApexKeysDir, kDataApexKeysDir);
+  if (!km_status.ok()) {
+    LOG(WARNING) << "Failed to initialize ApexKeyManager: " << km_status.error()
+                 << "; proceeding with pre-installed keys only";
+  }
   ApexFileRepository& instance = ApexFileRepository::GetInstance();
   Result<void> status = instance.AddPreInstalledApex(kApexPackageBuiltinDirs);
   if (!status.ok()) {
@@ -2626,11 +2644,26 @@ std::vector<ApexFileRef> SelectApexForActivation(
       continue;
     }
 
-    // The package must have a pre-installed version before we consider it for
-    // activation
+    // The package must either have a pre-installed version or have a trusted
+    // key registered in ApexKeyManager before we consider it for activation
     if (!instance.HasPreInstalledVersion(package_name)) {
-      LOG(INFO) << "Package " << package_name << " is not pre-installed";
-      continue;
+      bool key_trusted = false;
+      for (const auto& apex_ref : apex_files) {
+        if (ApexKeyManager::GetInstance().IsKeyTrusted(
+                package_name, apex_ref.get().GetBundledPublicKey())) {
+          key_trusted = true;
+          break;
+        }
+      }
+      if (!key_trusted) {
+        LOG(WARNING) << "Package " << package_name
+                     << " is not pre-installed and key is not trusted by "
+                        "ApexKeyManager; skipping";
+        continue;
+      }
+      LOG(INFO) << "Package " << package_name
+                << " is not pre-installed but trusted by ApexKeyManager; "
+                   "selecting for activation";
     }
 
     if (apex_files.size() == 1) {
@@ -3500,6 +3533,14 @@ int OnStartInVmMode() {
     return 1;
   }
 
+  ApexKeyManager& key_manager = ApexKeyManager::GetInstance();
+  auto km_status =
+      key_manager.Initialize(kProductApexKeysDir, kDataApexKeysDir);
+  if (!km_status.ok()) {
+    LOG(WARNING) << "Failed to initialize ApexKeyManager in VM mode: "
+                 << km_status.error();
+  }
+
   auto& instance = ApexFileRepository::GetInstance();
 
   // Scan pre-installed apexes
@@ -3730,8 +3771,8 @@ Result<void> CheckSupportsNonStagedInstall(const ApexFile& new_apex,
     }
   }
 
-  auto expected_public_key =
-      ApexFileRepository::GetInstance().GetPublicKey(new_manifest.name());
+  auto expected_public_key = ApexFileRepository::GetInstance().GetPublicKey(
+      new_manifest.name(), new_apex.GetBundledPublicKey());
   if (!expected_public_key.ok()) {
     return expected_public_key.error();
   }

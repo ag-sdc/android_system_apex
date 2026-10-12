@@ -20,10 +20,13 @@
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/result-gmock.h>
+#include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
+#include <endian.h>
 #include <errno.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <libavb/libavb.h>
 #include <microdroid/metadata.h>
 #include <sys/stat.h>
 
@@ -31,6 +34,7 @@
 #include <string>
 
 #include "apex_file.h"
+#include "apex_key_manager.h"
 #include "apexd_test_utils.h"
 #include "apexd_verity.h"
 
@@ -52,6 +56,23 @@ using ::testing::UnorderedElementsAre;
 static std::string GetTestDataDir() { return GetExecutableDirectory(); }
 static std::string GetTestFile(const std::string& name) {
   return GetTestDataDir() + "/" + name;
+}
+
+static std::string CreateTestAvbPublicKey(uint32_t key_num_bits,
+                                          uint8_t fill = 0x5b) {
+  size_t payload_bytes = 2 * (key_num_bits / 8);
+  size_t total_size = sizeof(AvbRSAPublicKeyHeader) + payload_bytes;
+  std::string data(total_size, static_cast<char>(fill));
+
+  AvbRSAPublicKeyHeader* header =
+      reinterpret_cast<AvbRSAPublicKeyHeader*>(&data[0]);
+  header->key_num_bits = htobe32(key_num_bits);
+  header->n0inv = htobe32(0x12345678);
+
+  // Set lowest bit of RSA modulus to 1 (odd modulus sanity check)
+  size_t lsb_offset = sizeof(AvbRSAPublicKeyHeader) + (key_num_bits / 8) - 1;
+  data[lsb_offset] |= 0x01;
+  return data;
 }
 
 namespace {
@@ -907,6 +928,217 @@ TEST_F(ApexFileRepositoryTestAddBlockApex, RespectIsFactoryBitFromMetadata) {
     ASSERT_EQ(is_factory,
               instance.HasPreInstalledVersion("com.android.apex.test_package"));
   }
+}
+
+TEST(ApexFileRepositoryTest, GetPublicKey_NonBuiltin_DelegatesToKeyManager) {
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  TemporaryDir product_keys_dir, data_keys_dir;
+  auto apex = ApexFile::Open(GetTestFile("apex.apexd_test_no_inst_key.apex"));
+  ASSERT_RESULT_OK(apex);
+  const std::string expected_key = apex->GetBundledPublicKey();
+
+  std::string key_file =
+      StringPrintf("%s/trusted_key.avbpubkey", product_keys_dir.path);
+  ASSERT_TRUE(android::base::WriteStringToFile(expected_key, key_file));
+
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(
+      product_keys_dir.path, data_keys_dir.path));
+
+  ApexFileRepository instance;
+  EXPECT_FALSE(instance.HasPreInstalledVersion(
+      "com.android.apex.test_package.no_inst_key"));
+
+  auto key_res =
+      instance.GetPublicKey("com.android.apex.test_package.no_inst_key");
+  ASSERT_RESULT_OK(key_res);
+  EXPECT_EQ(*key_res, expected_key);
+}
+
+TEST(ApexFileRepositoryTest,
+     GetPublicKey_OverrideDisabled_PrefersPreinstalled) {
+#ifdef APEX_ALLOW_KEY_OVERRIDE
+  GTEST_SKIP()
+      << "APEX_ALLOW_KEY_OVERRIDE is defined; skipping override-disabled test";
+#else
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  TemporaryDir built_in_dir, product_keys_dir, data_keys_dir;
+  fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
+
+  auto prebuilt_apex = ApexFile::Open(
+      StringPrintf("%s/apex.apexd_test.apex", built_in_dir.path));
+  ASSERT_RESULT_OK(prebuilt_apex);
+  const std::string preinstalled_key = prebuilt_apex->GetBundledPublicKey();
+
+  std::string override_key = CreateTestAvbPublicKey(4096, 0x77);
+  ASSERT_NE(preinstalled_key, override_key);
+
+  std::string key_file =
+      StringPrintf("%s/override.avbpubkey", data_keys_dir.path);
+  ASSERT_TRUE(android::base::WriteStringToFile(override_key, key_file));
+
+  std::string policy_xml =
+      "<key-policy>\n"
+      "  <key file=\"override.avbpubkey\">\n"
+      "    <allow package=\"com.android.apex.test_package\" />\n"
+      "  </key>\n"
+      "</key-policy>\n";
+  ASSERT_TRUE(android::base::WriteStringToFile(
+      policy_xml, StringPrintf("%s/apex-key-policy.xml", data_keys_dir.path)));
+
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(
+      product_keys_dir.path, data_keys_dir.path));
+
+  ApexFileRepository instance;
+  ASSERT_RESULT_OK(instance.AddPreInstalledApex({built_in_dir.path}));
+
+  auto key_res = instance.GetPublicKey("com.android.apex.test_package");
+  ASSERT_RESULT_OK(key_res);
+  EXPECT_EQ(*key_res, preinstalled_key);
+  EXPECT_NE(*key_res, override_key);
+#endif
+}
+
+TEST(ApexFileRepositoryTest, GetPublicKey_OverrideEnabled_PrefersKeyManager) {
+#ifndef APEX_ALLOW_KEY_OVERRIDE
+  GTEST_SKIP() << "APEX_ALLOW_KEY_OVERRIDE is not defined; skipping "
+                  "override-enabled test";
+#else
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  TemporaryDir built_in_dir, product_keys_dir, data_keys_dir;
+  fs::copy(GetTestFile("apex.apexd_test.apex"), built_in_dir.path);
+
+  auto prebuilt_apex = ApexFile::Open(
+      StringPrintf("%s/apex.apexd_test.apex", built_in_dir.path));
+  ASSERT_RESULT_OK(prebuilt_apex);
+  const std::string preinstalled_key = prebuilt_apex->GetBundledPublicKey();
+
+  std::string override_key = CreateTestAvbPublicKey(4096, 0x88);
+  ASSERT_NE(preinstalled_key, override_key);
+
+  std::string key_file =
+      StringPrintf("%s/override.avbpubkey", data_keys_dir.path);
+  ASSERT_TRUE(android::base::WriteStringToFile(override_key, key_file));
+
+  std::string policy_xml =
+      "<key-policy>\n"
+      "  <key file=\"override.avbpubkey\">\n"
+      "    <allow package=\"com.android.apex.test_package\" />\n"
+      "  </key>\n"
+      "</key-policy>\n";
+  ASSERT_TRUE(android::base::WriteStringToFile(
+      policy_xml, StringPrintf("%s/apex-key-policy.xml", data_keys_dir.path)));
+
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(
+      product_keys_dir.path, data_keys_dir.path));
+
+  ApexFileRepository instance;
+  ASSERT_RESULT_OK(instance.AddPreInstalledApex({built_in_dir.path}));
+
+  auto key_res = instance.GetPublicKey("com.android.apex.test_package");
+  ASSERT_RESULT_OK(key_res);
+  EXPECT_EQ(*key_res, override_key);
+  EXPECT_NE(*key_res, preinstalled_key);
+#endif
+}
+
+TEST(ApexFileRepositoryTest, AddDataApex_AcceptsNonBuiltinWithTrustedKey) {
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  TemporaryDir data_dir, product_keys_dir, data_keys_dir;
+  fs::copy(GetTestFile("apex.apexd_test_no_inst_key.apex"), data_dir.path);
+
+  auto apex = ApexFile::Open(GetTestFile("apex.apexd_test_no_inst_key.apex"));
+  ASSERT_RESULT_OK(apex);
+  const std::string pubkey = apex->GetBundledPublicKey();
+
+  std::string key_file =
+      StringPrintf("%s/no_inst.avbpubkey", product_keys_dir.path);
+  ASSERT_TRUE(android::base::WriteStringToFile(pubkey, key_file));
+
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(
+      product_keys_dir.path, data_keys_dir.path));
+
+  ApexFileRepository instance;
+  ASSERT_RESULT_OK(instance.AddDataApex(data_dir.path));
+
+  const std::string pkg_name = "com.android.apex.test_package.no_inst_key";
+  EXPECT_FALSE(instance.HasPreInstalledVersion(pkg_name));
+  EXPECT_TRUE(instance.HasDataVersion(pkg_name));
+
+  auto data_apexes = instance.GetDataApexFiles();
+  ASSERT_EQ(data_apexes.size(), 1u);
+  EXPECT_EQ(data_apexes[0].get().GetManifest().name(), pkg_name);
+}
+
+TEST(ApexFileRepositoryTest, AddDataApex_RejectsNonBuiltinWithoutTrustedKey) {
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  TemporaryDir data_dir, product_keys_dir, data_keys_dir;
+  fs::copy(GetTestFile("apex.apexd_test_no_inst_key.apex"), data_dir.path);
+
+  // Initialize with empty key directories
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(
+      product_keys_dir.path, data_keys_dir.path));
+
+  ApexFileRepository instance;
+  ASSERT_RESULT_OK(instance.AddDataApex(data_dir.path));
+
+  const std::string pkg_name = "com.android.apex.test_package.no_inst_key";
+  EXPECT_FALSE(instance.HasPreInstalledVersion(pkg_name));
+  EXPECT_FALSE(instance.HasDataVersion(pkg_name));
+  EXPECT_EQ(instance.GetDataApexFiles().size(), 0u);
+}
+
+TEST(ApexFileRepositoryTest, AddDataApex_RejectsAllowlistMismatch) {
+  ApexKeyManager::GetInstance().Reset();
+  auto key_guard = android::base::make_scope_guard(
+      []() { ApexKeyManager::GetInstance().Reset(); });
+
+  TemporaryDir data_dir, product_keys_dir, data_keys_dir;
+  fs::copy(GetTestFile("apex.apexd_test_no_inst_key.apex"), data_dir.path);
+
+  auto apex = ApexFile::Open(GetTestFile("apex.apexd_test_no_inst_key.apex"));
+  ASSERT_RESULT_OK(apex);
+  const std::string pubkey = apex->GetBundledPublicKey();
+
+  std::string key_file =
+      StringPrintf("%s/vendor.avbpubkey", product_keys_dir.path);
+  ASSERT_TRUE(android::base::WriteStringToFile(pubkey, key_file));
+
+  // Policy does NOT allow com.android.apex.test_package.no_inst_key
+  std::string policy_xml =
+      "<key-policy>\n"
+      "  <key file=\"vendor.avbpubkey\">\n"
+      "    <allow package=\"com.other.allowed.app\" />\n"
+      "  </key>\n"
+      "</key-policy>\n";
+  ASSERT_TRUE(android::base::WriteStringToFile(
+      policy_xml,
+      StringPrintf("%s/apex-key-policy.xml", product_keys_dir.path)));
+
+  ASSERT_RESULT_OK(ApexKeyManager::GetInstance().Initialize(
+      product_keys_dir.path, data_keys_dir.path));
+
+  ApexFileRepository instance;
+  ASSERT_RESULT_OK(instance.AddDataApex(data_dir.path));
+
+  const std::string pkg_name = "com.android.apex.test_package.no_inst_key";
+  EXPECT_FALSE(instance.HasPreInstalledVersion(pkg_name));
+  EXPECT_FALSE(instance.HasDataVersion(pkg_name));
+  EXPECT_EQ(instance.GetDataApexFiles().size(), 0u);
 }
 
 }  // namespace apex

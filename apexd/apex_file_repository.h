@@ -101,6 +101,12 @@ class ApexFileRepository final {
   android::base::Result<const std::string> GetPublicKey(
       const std::string& name) const;
 
+  // Returns trusted public key for an apex with the given |name| and
+  // |bundled_pubkey|. If |bundled_pubkey| is provided, it disambiguates when
+  // multiple unrestricted keys exist.
+  android::base::Result<const std::string> GetPublicKey(
+      const std::string& name, const std::string& bundled_pubkey) const;
+
   // Returns path to the pre-installed version of an apex with the given |name|.
   android::base::Result<const std::string> GetPreinstalledPath(
       const std::string& name) const;

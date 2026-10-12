@@ -20,6 +20,7 @@ import android.apex.ApexInfo;
 import android.apex.ApexInfoList;
 import android.apex.ApexSessionInfo;
 import android.apex.ApexSessionParams;
+import android.apex.ApexTrustedKey;
 import android.apex.CompressedApexInfoList;
 
 interface IApexService {
@@ -138,4 +139,43 @@ interface IApexService {
     * Performs a non-staged install of the given APEX.
     */
    ApexInfo installAndActivatePackage(in @utf8InCpp String packagePath, boolean force);
+
+   /**
+    * Installs or updates a trusted public key in /data/apex/keys/.
+    *
+    * @param keyPath Path to the .avbpubkey file on disk.
+    * @param keyName Optional key alias/name. If null, the filename stem is used.
+    * @param allowedPackages Optional list of package names allowed for this key.
+    *                        If null or empty, the key is unrestricted.
+    * @throws SecurityException if caller is not root or system_server.
+    * @throws ServiceSpecificException on installation or validation failure.
+    */
+   void addTrustedKey(in @utf8InCpp String keyPath,
+                      in @utf8InCpp @nullable String keyName,
+                      in @utf8InCpp @nullable String[] allowedPackages);
+
+   /**
+    * Removes a trusted public key from /data/apex/keys/ by name.
+    *
+    * @param keyName Name of the trusted key to remove.
+    * @throws SecurityException if caller is not root or system_server.
+    * @throws ServiceSpecificException if key is not found or is in /product.
+    */
+   void removeTrustedKey(in @utf8InCpp String keyName);
+
+   /**
+    * Lists all active trusted public keys across /product and /data stores.
+    *
+    * @return Array of active ApexTrustedKey records.
+    * @throws SecurityException if caller is not root or system_server.
+    */
+   ApexTrustedKey[] listTrustedKeys();
+
+   /**
+    * Hot-reloads trusted public keys from /data/apex/keys/.
+    *
+    * @throws SecurityException if caller is not root or system_server.
+    * @throws ServiceSpecificException on reload failure.
+    */
+   void reloadKeys();
 }
